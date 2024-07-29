@@ -1,0 +1,6 @@
+azure-kusto-data==4.5.1
+azure-kusto-ingest==4.5.1
+azure-mgmt-kusto===3.3.0
+Flask-RESTful==0.3.10
+pandas==2.2.2
+scikit-learn==1.5.1

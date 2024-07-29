@@ -1,0 +1,11 @@
+{
+    "deployedToProduction": false,
+    "contacts": [ "cgonzales@microsoft.com", "es365dp@microsoft.com" ],
+    "requestor":  "7c2d5c8a-5c55-6f9b-9740-5add009cf183",
+    "description": "Personal repository for cgonzales--personal scripts to show during reviews, etc.",
+    "complianceTypes": [],
+    "inventoryId": [ " " ],
+    "schema": {
+        "office": "1.0.0"
+    }
+}
