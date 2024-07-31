@@ -1,3 +1,5 @@
+import signal
+import sys
 from azure.kusto.data import KustoClient, KustoConnectionStringBuilder, ClientRequestProperties
 from azure.kusto.data.exceptions import KustoServiceError
 from azure.kusto.data.helpers import dataframe_from_result_table
@@ -18,21 +20,19 @@ from pandas.core.series import Series
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import train_test_split
 
-
-app = Flask(__name__)
-api = Api(app)
-
-matcher = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$")
-
 icm_cluster = "https://icmcluster.kusto.windows.net"
 nrp_cluster = "https://nrp.kusto.windows.net"
 
 # TODO: Replace all print statements with logging
 # TODO: Make the date range parameterable
 query_for_all_exceptions_for_one_incident = r"""
-let CreateTopNFromDateRange = (subscription_id: string, incident_time: datetime) {
-    let incident_start = datetime_add('day',-1, incident_time);
-    let incident_end = datetime_add('day', 1, incident_time);
+let CreateTopNFromDateRange = (subscription_id: string, incident_time: string) { 
+		// incident_time format => "7/02/2024 9:50:00 PM UTC"
+	let time_str = extract("([0-9]{1,2}/[0-9]{1,2}/[0-9]{4} [0-9]{1,2}:[0-9]{2}:[0-9]{2})", 1, incident_time);
+	let am_pm = extract("(AM|PM)", 1, incident_time);
+	let adjusted_time = iif(am_pm == "PM", datetime_add('hour', 12, todatetime(time_str)), datetime_add('hour', 0, todatetime(time_str)) );
+    let incident_start = datetime_add('day',-1, adjusted_time);
+    let incident_end = datetime_add('day', 1, adjusted_time);
     let QosExceptionsData = 
         cluster('Nrp').database("mdsnrp").QosExceptions
         | where timepoint between(incident_start..incident_end)
@@ -46,9 +46,9 @@ let CreateTopNFromDateRange = (subscription_id: string, incident_time: datetime)
     QosExceptionsData
     | join kind=inner hint.strategy=broadcast (QosEtwEventData) on OperationName 
     | extend methods = split(classmethod_set, '|')
-    | extend top_method = tostring(methods[0]) // top of stack
-    | project PreciseTimeStamp=timepoint, SubscriptionId, CorrelationRequestId, ResourceType, ResourceGroup, ErrorDetails, full_em, top_method
-    | summarize count() by top_method
+    | extend bottom_method = tostring(methods[0]) // bottom of stack
+    | project PreciseTimeStamp=timepoint, SubscriptionId, CorrelationRequestId, ResourceType, ResourceGroup, ErrorDetails, full_em, bottom_method
+    | summarize count() by bottom_method
     | order by count_
     | take 100
 };
@@ -60,6 +60,7 @@ query_for_all_incidents = r"""cluster('icmcluster.kusto.windows.net').database('
 | where OwningTeamName in (@"CLOUDNET\RNM", @"CLOUDNET\NRP", "NetworkAnalytics", @"CLOUDNET\NetAnalytics", // 
     @"CLOUDNET\SLB", @"CLOUDNET\ApplicationGateway", @"CLOUDNET\Gateway Manager", @"CLOUDNET\ExpressRouteSupport",
     @"CLOUDNET\Azure Bastion", @"CLOUDNET\VirtualWAN", @"CLOUDNET\DDOS", @"CLOUDNET\NRP")
+| where Status != "ACTIVE"
 | join kind=inner IncidentDescriptions on $left.IncidentId == $right.IncidentId
 | where Text contains "AZURE SUPPORT CENTER"
 // TODO: Make this regular expression more resilient
@@ -69,6 +70,7 @@ query_for_all_incidents = r"""cluster('icmcluster.kusto.windows.net').database('
 | extend IncidentStartTime=iff(IncidentStartTime == "", tostring(SourceCreateDate), IncidentStartTime)
 | distinct OwningTeamName, IncidentStartTime, AzSubscriptionId
 """
+
 icm_kusto_conn_str_builder = KustoConnectionStringBuilder.with_az_cli_authentication(icm_cluster)
 nrp_kusto_conn_str_builder = KustoConnectionStringBuilder.with_az_cli_authentication(nrp_cluster)
 	
@@ -81,22 +83,33 @@ all_exceptions = set()
 in_memory_backing_store = dict()
 lock = threading.Lock()
 
+class Helper:
+    @staticmethod
+    def return_correct_datetime(input_datetime: str) -> str:
+        matcher = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$")
+        if matcher.match(input_datetime):
+            return input_datetime
+        datetime_obj = datetime.strptime(input_datetime, "%m/%d/%Y %I:%M:%S %p UTC")
+        output_datetime_str = datetime_obj.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "000Z"
+        return output_datetime_str
+
+    @staticmethod
+    def return_formatted_query_for_specific_incident(query_for_all_exceptions_for_one_incident: str, az_subscription_id: str, input_datetime: str) -> str:
+        query_str = f"{query_for_all_exceptions_for_one_incident}CreateTopNFromDateRange(\"{az_subscription_id}\", datetime(\"{input_datetime}\")"
+        return query_str
+
+
 class Exceptions(Resource):
-
-	def return_formatted_query_for_specific_incident(self, az_subscription_id: str, input_datetime:str) -> str:
-		query_str = f"{query_for_all_exceptions_for_one_incident}CreateTopNFromDateRange(\"{az_subscription_id}\", datetime({input_datetime}))"
-		return query_str
-
 	def execute_nrp_query(self, owning_team_name: str, az_subscription_id: str, incident_start_time: str, final_list: List[Dict[str, Any]],\
 	hashcode: str, backing_store: Dict[str, Dict[str, Any]]) -> None:
 		try:
-			incident_query = self.return_formatted_query_for_specific_incident(az_subscription_id, incident_start_time)
+			incident_query = Helper.return_formatted_query_for_specific_incident(az_subscription_id, incident_start_time)
 			results = nrp_client.execute_streaming_query("mdsnrp", incident_query)
 			tables_iter = results.iter_primary_results()
 			first_table = next(tables_iter)
 			dictionary_for_incident = {"team": owning_team_name}
 			for row in first_table:
-				exception = row["top_method"]
+				exception = row["bottom_method"]
 				count = int(row["count_"])
 				if (exception == None):
 					print(f"Exception is none for {owning_team_name}")
@@ -108,12 +121,6 @@ class Exceptions(Resource):
 		except Exception as e:
 			print(e)
 
-	def return_correct_datetime(self, input_datetime:str) -> str:
-		if matcher.match(input_datetime):
-			return input_datetime
-		datetime_obj = datetime.strptime(input_datetime, "%m/%d/%Y %I:%M:%S %p UTC")
-		output_datetime_str = datetime_obj.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "000Z"
-		return output_datetime_str
 
 	def get_hashcode(self, owning_team_name: str, incident_start_time: str, az_subscription_id: str) -> str:
 		return hash(f"{owning_team_name}{incident_start_time}{az_subscription_id}")
@@ -127,7 +134,7 @@ class Exceptions(Resource):
 		# Will block until each row arrives
 		for row in first_table:
 			owning_team_name = row["OwningTeamName"]
-			incident_start_time = self.return_correct_datetime(row["IncidentStartTime"])
+			incident_start_time = Helper.return_correct_datetime(row["IncidentStartTime"])
 			az_subscription_id = row["AzSubscriptionId"]
 			if (az_subscription_id == "NULL"):
 				print("az_subscription_id is null.")
@@ -184,28 +191,15 @@ class Train(Resource):
 				if exception not in incident:
 					incident[exception] = 0
 
-	# TODO: This is duplicated, shove into a separate type and inject?
-	def return_correct_datetime(self, input_datetime:str) -> str:
-		if matcher.match(input_datetime):
-			return input_datetime
-		datetime_obj = datetime.strptime(input_datetime, "%m/%d/%Y %I:%M:%S %p UTC")
-		output_datetime_str = datetime_obj.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "000Z"
-		return output_datetime_str
-
-	# TODO: This is duplicated, shove into a separate type and inject?
-	def return_formatted_query_for_specific_incident(self, az_subscription_id: str, input_datetime:str) -> str:
-		query_str = f"{query_for_all_exceptions_for_one_incident}CreateTopNFromDateRange(\"{az_subscription_id}\", datetime({input_datetime}))"
-		return query_str
-
 	def execute_nrp_query(self, owning_team_name: str, az_subscription_id: str, incident_start_time: str) -> Dict[str, Any]:
 		dictionary_for_incident = {"team": owning_team_name}
 		try:
-			incident_query = self.return_formatted_query_for_specific_incident(az_subscription_id, incident_start_time)
+			incident_query = Helper.return_formatted_query_for_specific_incident(az_subscription_id, incident_start_time)
 			results = nrp_client.execute_streaming_query("mdsnrp", incident_query)
 			tables_iter = results.iter_primary_results()
 			first_table = next(tables_iter)
 			for row in first_table:
-				exception = row["top_method"]
+				exception = row["bottom_method"]
 				count = int(row["count_"])
 				if (exception == None):
 					print(f"Exception is none for {owning_team_name}")
@@ -240,7 +234,7 @@ class Train(Resource):
 		all_threads = list()
 		row = next(first_table)
 		owning_team_name = row["OwningTeamName"]
-		incident_start_time = self.return_correct_datetime(row["IncidentStartTime"])
+		incident_start_time = Helper.return_correct_datetime(row["IncidentStartTime"])
 		az_subscription_id = row["AzSubscriptionId"]
 		if (az_subscription_id == "NULL"):
 			raise Exception("az_subscription_id is null.")
@@ -272,10 +266,22 @@ class Train(Resource):
 		pprint(all_exceptions)
 		return all_incident_data
 
-api.add_resource(Exceptions, '/exceptions', '/exceptions/fetch', '/exceptions/refresh')
-api.add_resource(Train, '/train', '/train/<string:training_model>', '/train/<int:icm_number>')
+def create_app():
+    app = Flask(__name__)
+    api = Api(app)
+
+    api.add_resource(Exceptions, '/exceptions', '/exceptions/fetch', '/exceptions/refresh')
+    api.add_resource(Train, '/train', '/train/<string:training_model>', '/train/<int:icm_number>')
+
+    return app
+
+def signal_handler(signal, frame):
+    print('Shutting down gracefully...')
+    icm_client.close()
+    nrp_client.close()
+    sys.exit(0)
+	
 if __name__ == '__main__':
+	app = create_app()
+	signal.signal(signal.SIGINT, signal_handler)
 	app.run(debug=True)
-	# TODO: Catch the signal here for CTRL+C and close the clients properly
-	icm_client.close()
-	nrp_client.close()
