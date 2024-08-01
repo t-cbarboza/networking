@@ -6,17 +6,18 @@ from azure.kusto.data.helpers import dataframe_from_result_table
 from azure.kusto.data.response import KustoStreamingResponseDataSet
 from datetime import datetime
 from datetime import timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_restful import reqparse, abort, Api, Resource
 from pprint import pprint
 import re
-import threading
 from typing import Any, Dict, List
 import pandas as pd
 from pandas.core.frame import DataFrame
-from pandas.core.series import Series
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import train_test_split
+from tabulate import tabulate
+
+
+app = Flask(__name__)
+api = Api(app)
 
 queryGrabIcm = r"""
 let grabICM = (SRN: int) { 
@@ -42,8 +43,8 @@ let logs_of_interest = (subscription_id: string, resource_group: string, inciden
         | where UserError == false
         // | where ErrorDetails contains "Facade" 
         | sort by TIMESTAMP asc
-        | project TIMESTAMP,StackTrace, ErrorDetails, ErrorCode, CorrelationRequestId, OperationId, OperationName, ResourceGroup, UserError;
-        //| partition hint.strategy=Native by StackTrace(top 1 by ErrorDetails);
+        | project TIMESTAMP,StackTrace, ErrorDetails, ErrorCode, CorrelationRequestId, OperationId, OperationName, ResourceGroup
+        | partition hint.strategy=Native by StackTrace(top 1 by ErrorDetails);
 };
 """
 
@@ -56,7 +57,7 @@ teamMap = {
     "networkservice": "CLOUDNET/Network Manager",
     "nrp": "CLOUDNET/NRP",
     "pubsub": "CLOUDNET/SdnPubSub",
-    "frontend" : "CLOUDNET/temp"
+    # "frontend" : "CLOUDNET/temp"  test
 }
 
 icmCluster = "https://icmcluster.kusto.windows.net"
@@ -75,8 +76,12 @@ class Helper:
         if matcher.match(inputDatetime):
             return inputDatetime
         datetimeObj = datetime.strptime(inputDatetime, "%m/%d/%Y %I:%M:%S %p UTC")
-        outputDatetimeStr = datetimeObj.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        outputDatetimeStr = datetimeObj.strftime("%Y-%m-%dT%H:%M:%S")
         return outputDatetimeStr
+    
+    @staticmethod
+    def dataframe_to_html(df: pd.DataFrame) -> str:
+        return df.to_html()
 
 class Exceptions(Resource):
     ####### ICM #######
@@ -116,7 +121,8 @@ class Exceptions(Resource):
         return result
     
     ####### NRP #######
-    def executeNrpQuery(self, subscriptionId: str, resourceGroup: str, incidentTime: datetime) -> Dict[str, Any]:
+    def executeNrpQuery(self, subscriptionId: str, resourceGroup: str, incidentTime: str) -> Dict[str, Any]:
+        print(f"entered executeNRP: subscription {subscriptionId}&resourceGroup={resourceGroup}&incidentTime={incidentTime}, time: {type(incidentTime)}")
         queryStr = f"{queryQos}logs_of_interest(\"{subscriptionId}\", \"{resourceGroup}\", datetime(\"{incidentTime}\"))"
         try:
             response = nrpClient.execute("mdsnrp", queryStr)
@@ -125,8 +131,11 @@ class Exceptions(Resource):
                 self.parseErrorDetails(resultDf)
                 self.mapToTeams(resultDf)
                 self.get_predicted_owning_team(resultDf)
+                html_table = Helper.dataframe_to_html(resultDf)
                 resultDict = resultDf.to_dict(orient='records')
-                return {"status": "success", "data": resultDict}
+                formatted_link = f"http://127.0.0.1:5000/show_table?subscriptionId={subscriptionId}&resourceGroup={resourceGroup}&incidentTime={incidentTime}"
+                print(f"Generated URL: {formatted_link}, time: {type(incidentTime)}")  # Debugging
+                return {"status": "success", "a_formatted_link": formatted_link, "data": resultDict, "html_table": html_table}
             else:
                 return {"status": "no_data", "message": "No ErrorDetails found."}
         except KustoServiceError as e:
@@ -191,9 +200,10 @@ class Exceptions(Resource):
             return ""
 
         errorLogs['predictedOwningTeam'] = errorLogs['mappedTeams'].apply(get_team)
-        return errorLogs
-        
+        return errorLogs                        
     
+
+    ####### executing #######
     def get(self):
         supportRequestNumber = request.args.get('support_request_number')
         if not supportRequestNumber:
@@ -208,7 +218,43 @@ class Exceptions(Resource):
         incidentTime = icmResult['criTime']
         
         nrpResult = self.executeNrpQuery(subscriptionId, resourceGroup, incidentTime)
-        return jsonify({"icmResult": icmResult, "nrpResult": nrpResult})
+        return jsonify({"icmResult": icmResult, "j_nrpTableHtml" : "formatted_link", "nrpResult": nrpResult})
+
+@app.route('/show_table')
+def show_table():
+    # Example of getting query parameters from the request
+    print(f"test")
+    subscriptionId = request.args.get('subscriptionId')
+    resourceGroup = request.args.get('resourceGroup')
+    incidentTime = request.args.get('incidentTime')
+
+    if not subscriptionId or not resourceGroup or not incidentTime:
+        return {"error": "All parameters (subscriptionId, resourceGroup, incidentTime) are required"}, 400
+   
+    exceptions_instance = Exceptions()
+    nrpResult = exceptions_instance.executeNrpQuery(subscriptionId, resourceGroup, incidentTime)
+
+    if 'status' in nrpResult and nrpResult['status'] == 'error':
+        return jsonify({"result": nrpResult})
+    
+    html_table = nrpResult.get("html_table", "No data available")
+    formatted_link = nrpResult.get("formatted_link", "")
+
+
+    # Render the HTML table in an HTML template
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>DataFrame as HTML Table</title>
+    </head>
+    <body>
+        <h1>Data Table</h1>
+        {{ table|safe }}
+    </body>
+    </html>
+    ''', table=html_table)  
 
 
 def signalHandler(signal, frame):
@@ -218,8 +264,6 @@ def signalHandler(signal, frame):
     sys.exit(0)
  
 if __name__ == '__main__':
-    app = Flask(__name__)
-    api = Api(app)
     api.add_resource(Exceptions, '/exceptions', '/exceptions/fetch', '/exceptions/refresh')
     signal.signal(signal.SIGINT, signalHandler)
     app.run(debug=True)
