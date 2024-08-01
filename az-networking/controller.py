@@ -23,10 +23,11 @@ queryGrabIcm = r"""
 let grabICM = (SRN: int) { 
     cluster('icmcluster.kusto.windows.net').database('IcMDataWarehouse').Incidents
         | where SupportTicketId == 2407230030010477
-        | where IncidentType == "CustomerReported"
         | where Status != "ACTIVE"
+        | where not(isempty(Summary))
         | order by ModifiedDate asc
-        | project Summary
+        | project Summary, IncidentId
+        // other useful ones include (IncidentType == "CustomerReported"), Status != "ACTIVE", (IncidentId and SupportTicketId are unique)
         | take 1;
 };
 """
@@ -43,8 +44,8 @@ let logs_of_interest = (subscription_id: string, resource_group: string, inciden
         | where UserError == false
         // | where ErrorDetails contains "Facade" 
         | sort by TIMESTAMP asc
-        | project TIMESTAMP,StackTrace, ErrorDetails, ErrorCode, CorrelationRequestId, OperationId, OperationName, ResourceGroup
-        | partition hint.strategy=Native by StackTrace(top 1 by ErrorDetails);
+        | project TIMESTAMP,StackTrace, ErrorDetails, ErrorCode, CorrelationRequestId, OperationId, OperationName, ResourceGroup;
+        //| partition hint.strategy=Native by StackTrace(top 1 by ErrorDetails);
 };
 """
 
@@ -86,13 +87,14 @@ class Helper:
 class Exceptions(Resource):
     ####### ICM #######
     def executeIcmQuery(self, supportRequestNumber: str) -> Dict[str, Any]:
+        print("entered ICM query")
         queryStr = f"{queryGrabIcm}grabICM({supportRequestNumber})"
         try:
             response = icmClient.execute("IcMDataWarehouse", queryStr)
             resultDf = dataframe_from_result_table(response.primary_results[0])
-            if not resultDf.empty:
+            if not resultDf.empty and resultDf.iloc[0]['Summary']:
                 summary = resultDf.iloc[0]['Summary']
-                return self.parseSummary(summary)
+                return self.parseSummary(summary, supportRequestNumber)
             else:
                 return "No results found."
         except KustoServiceError as e:
@@ -100,19 +102,21 @@ class Exceptions(Resource):
         except Exception as e:
             return str(e)
         
-    def parseSummary(self, summary: str)  -> Dict[str, str]:
+    def parseSummary(self, summary: str, supportRequestNumber: int)  -> Dict[str, str]:
         result = {}
+        print("entered parseSummary")
         subscriptionIdMatch = re.search(r'href="https://azuresupportcenter\.azure\.com/resourceExplorer/subscription/([a-f0-9\-]+)\?', summary)
-   
         if subscriptionIdMatch:
             subscriptionId = subscriptionIdMatch.group(1)
             result['subscriptionId'] = subscriptionId
+            result['supportRequestNumber'] = supportRequestNumber
             resourceUriMatch = re.search(rf'/subscriptions/{subscriptionId}/resource[Gg]roups/([0-9a-zA-Z-_]+)/providers/Microsoft\.Network/([0-9a-zA-Z-_]+)/([0-9a-zA-Z-_]+)', summary)
             if resourceUriMatch:
                 result['resourceGroup'] = resourceUriMatch.group(1)
                 result['provider'] = resourceUriMatch.group(2)
                 result['providerName'] = resourceUriMatch.group(3)
                 result['resourceUri'] = resourceUriMatch.group(0)
+            
             criTimeMatch = re.search(r'(\d{1,2}/\d{1,2}/\d{4}\s\d{1,2}:\d{2}:\d{2}\s[AP]M\sUTC)', summary)
             if criTimeMatch:
                 result['criTime'] = Helper.formattedDatetime(criTimeMatch.group(1))
@@ -121,21 +125,21 @@ class Exceptions(Resource):
         return result
     
     ####### NRP #######
-    def executeNrpQuery(self, subscriptionId: str, resourceGroup: str, incidentTime: str) -> Dict[str, Any]:
-        print(f"entered executeNRP: subscription {subscriptionId}&resourceGroup={resourceGroup}&incidentTime={incidentTime}, time: {type(incidentTime)}")
+    def executeNrpQuery(self, subscriptionId: str, resourceGroup: str, incidentTime: str, supportRequestNumber: str) -> Dict[str, Any]:
         queryStr = f"{queryQos}logs_of_interest(\"{subscriptionId}\", \"{resourceGroup}\", datetime(\"{incidentTime}\"))"
         try:
             response = nrpClient.execute("mdsnrp", queryStr)
             resultDf = dataframe_from_result_table(response.primary_results[0])
             if not resultDf.empty:
+                print('executeNrpQuery srn:', supportRequestNumber)
+                resultDf['supportRequestNumber'] = f"https://portal.microsofticm.com/imp/v5/incidents/details/{supportRequestNumber}/summary"
                 self.parseErrorDetails(resultDf)
                 self.mapToTeams(resultDf)
                 self.get_predicted_owning_team(resultDf)
                 html_table = Helper.dataframe_to_html(resultDf)
                 resultDict = resultDf.to_dict(orient='records')
-                formatted_link = f"http://127.0.0.1:5000/show_table?subscriptionId={subscriptionId}&resourceGroup={resourceGroup}&incidentTime={incidentTime}"
-                print(f"Generated URL: {formatted_link}, time: {type(incidentTime)}")  # Debugging
-                return {"status": "success", "a_formatted_link": formatted_link, "data": resultDict, "html_table": html_table}
+                formatted_link = f"http://127.0.0.1:5000/show_table?subscriptionId={subscriptionId}&resourceGroup={resourceGroup}&incidentTime={incidentTime}&supportRequestNumber={supportRequestNumber}"
+                return {"status": "success", "a_html_table_link": formatted_link, "data": resultDict, "html_table": html_table}
             else:
                 return {"status": "no_data", "message": "No ErrorDetails found."}
         except KustoServiceError as e:
@@ -216,23 +220,24 @@ class Exceptions(Resource):
         subscriptionId = icmResult['subscriptionId']
         resourceGroup = icmResult['resourceGroup']
         incidentTime = icmResult['criTime']
+        supportRequestNumber2 = icmResult['supportRequestNumber']
         
-        nrpResult = self.executeNrpQuery(subscriptionId, resourceGroup, incidentTime)
-        return jsonify({"icmResult": icmResult, "j_nrpTableHtml" : "formatted_link", "nrpResult": nrpResult})
+        nrpResult = self.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, supportRequestNumber)
+        return jsonify({"icmResult": icmResult, "nrpResult": nrpResult})
 
 @app.route('/show_table')
 def show_table():
-    # Example of getting query parameters from the request
-    print(f"test")
     subscriptionId = request.args.get('subscriptionId')
     resourceGroup = request.args.get('resourceGroup')
     incidentTime = request.args.get('incidentTime')
+    supportRequestNumber = request.args.get('supportRequestNumber')
+    # print('srn:', supportRequestNumber)
 
     if not subscriptionId or not resourceGroup or not incidentTime:
         return {"error": "All parameters (subscriptionId, resourceGroup, incidentTime) are required"}, 400
    
     exceptions_instance = Exceptions()
-    nrpResult = exceptions_instance.executeNrpQuery(subscriptionId, resourceGroup, incidentTime)
+    nrpResult = exceptions_instance.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, supportRequestNumber)
 
     if 'status' in nrpResult and nrpResult['status'] == 'error':
         return jsonify({"result": nrpResult})
@@ -240,8 +245,6 @@ def show_table():
     html_table = nrpResult.get("html_table", "No data available")
     formatted_link = nrpResult.get("formatted_link", "")
 
-
-    # Render the HTML table in an HTML template
     return render_template_string('''
     <!DOCTYPE html>
     <html lang="en">
@@ -254,8 +257,7 @@ def show_table():
         {{ table|safe }}
     </body>
     </html>
-    ''', table=html_table)  
-
+    ''', table=html_table) 
 
 def signalHandler(signal, frame):
     print('Shutting down gracefully...')
