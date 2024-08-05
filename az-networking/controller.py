@@ -20,17 +20,31 @@ app = Flask(__name__)
 api = Api(app)
 
 queryGrabIcm = r"""
-let grabICM = (SRN: int) { 
+let grabICM = (incidentId: int) { 
     cluster('icmcluster.kusto.windows.net').database('IcMDataWarehouse').Incidents
-        | where SupportTicketId == 2407230030010477
+        | where IncidentId == incidentId
         | where Status != "ACTIVE"
         | where not(isempty(Summary))
         | order by ModifiedDate asc
-        | project Summary, IncidentId
-        // other useful ones include (IncidentType == "CustomerReported"), Status != "ACTIVE", (IncidentId and SupportTicketId are unique)
+        | project Summary, SupportTicketId
+        // other useful ones include (IncidentType == "CustomerReported"), Status != "ACTIVE", (IncidentId more unique than SupportTicketId)
         | take 1;
 };
 """
+
+# queryGrabIcm = r"""
+# let grabICM = (supportTicketId: string) { 
+#     cluster('icmcluster.kusto.windows.net').database('IcMDataWarehouse').Incidents
+#         | where SupportTicketId == supportTicketId
+#         | where Status != "ACTIVE"
+#         | where not(isempty(Summary))
+#         | order by ModifiedDate asc
+#         | project Summary, SupportTicketId, IncidentId
+#         // other useful ones include (IncidentType == "CustomerReported"), Status != "ACTIVE", (IncidentId more unique than SupportTicketId)
+#         | take 1;
+# };
+# """
+
 
 queryQos = r"""
 let logs_of_interest = (subscription_id: string, resource_group: string, incident_time: datetime) { 
@@ -50,15 +64,19 @@ let logs_of_interest = (subscription_id: string, resource_group: string, inciden
 """
 
 teamMap = {
-    "rnm": "CLOUDNET/RNM",
-    "nrpinternal": "CLOUDNET/NRP",
-    "networkanalytics": "CLOUDNET/NetAnalytics",
-    "slb": "CLOUDNET/SLB",
-    "virtualwan": "CLOUDNET/VirtualWAN",
-    "networkservice": "CLOUDNET/Network Manager",
-    "nrp": "CLOUDNET/NRP",
-    "pubsub": "CLOUDNET/SdnPubSub",
-    # "frontend" : "CLOUDNET/temp"  test
+    "rnm": "Cloudnet/RNM",
+    "nrpinternal": "Cloudnet/NRP",
+    "networkanalytics": "Cloudnet/NetAnalytics",
+    "slb": "Cloudnet/SLB",
+    "virtualwan": "Cloudnet/VirtualWAN",
+    "networkservice": "Cloudnet/Network Manager",
+    "nrp": "Cloudnet/NRP",
+    "pubsubfacade": "Cloudnet/SdnPubSub",
+    "putapplicationgatewayasync": "Cloudnet/ApplicationGateway",
+    "applicationgatewayhelper": "Cloudnet/ApplicationGateway",
+    "applicationgatewayoperationbackgroundtask": "Cloudnet/ApplicationGateway",
+    "applicationgateways": "Cloudnet/ApplicationGateway",
+    # "frontend" : "Cloudnet/temp"  test
 }
 
 icmCluster = "https://icmcluster.kusto.windows.net"
@@ -84,17 +102,25 @@ class Helper:
     def dataframe_to_html(df: pd.DataFrame) -> str:
         return df.to_html()
 
+    @staticmethod
+    def get_value_from_top(data, key) -> str:
+        if data and isinstance(data, list) and key in data[0]:
+            return data[0].get(key)
+        else:
+            return "Could not predict team"
+
 class Exceptions(Resource):
     ####### ICM #######
-    def executeIcmQuery(self, supportRequestNumber: str) -> Dict[str, Any]:
+    def executeIcmQuery(self, incidentId: str) -> Dict[str, Any]:
         print("entered ICM query")
-        queryStr = f"{queryGrabIcm}grabICM({supportRequestNumber})"
+        queryStr = f"{queryGrabIcm}grabICM({incidentId})"
         try:
             response = icmClient.execute("IcMDataWarehouse", queryStr)
             resultDf = dataframe_from_result_table(response.primary_results[0])
-            if not resultDf.empty and resultDf.iloc[0]['Summary']:
-                summary = resultDf.iloc[0]['Summary']
-                return self.parseSummary(summary, supportRequestNumber)
+            if not resultDf.empty:
+                summary = resultDf.iloc[0]['Summary'] if 'Summary' in resultDf.columns else None
+                supportRequestNumber = resultDf.iloc[0]['SupportTicketId'] if 'SupportTicketId' in resultDf.columns else None
+                return self.parseSummary(summary, supportRequestNumber,incidentId)
             else:
                 return "No results found."
         except KustoServiceError as e:
@@ -102,14 +128,23 @@ class Exceptions(Resource):
         except Exception as e:
             return str(e)
         
-    def parseSummary(self, summary: str, supportRequestNumber: int)  -> Dict[str, str]:
-        result = {}
+    def parseSummary(self, summary: str, supportRequestNumber: int, incidentId: int)  -> Dict[str, str]:
+        result = {
+            'subscriptionId': 'N/A',
+            'supportRequestNumber': str(supportRequestNumber),
+            'incidentId': str(incidentId),
+            'resourceGroup': 'N/A',
+            'provider': 'N/A',
+            'providerName': 'N/A',
+            'criTime': '2024-06-11 03:59:00'
+        }
         print("entered parseSummary")
         subscriptionIdMatch = re.search(r'href="https://azuresupportcenter\.azure\.com/resourceExplorer/subscription/([a-f0-9\-]+)\?', summary)
         if subscriptionIdMatch:
             subscriptionId = subscriptionIdMatch.group(1)
             result['subscriptionId'] = subscriptionId
             result['supportRequestNumber'] = supportRequestNumber
+            result['incidentId'] = incidentId
             resourceUriMatch = re.search(rf'/subscriptions/{subscriptionId}/resource[Gg]roups/([0-9a-zA-Z-_]+)/providers/Microsoft\.Network/([0-9a-zA-Z-_]+)/([0-9a-zA-Z-_]+)', summary)
             if resourceUriMatch:
                 result['resourceGroup'] = resourceUriMatch.group(1)
@@ -125,21 +160,22 @@ class Exceptions(Resource):
         return result
     
     ####### NRP #######
-    def executeNrpQuery(self, subscriptionId: str, resourceGroup: str, incidentTime: str, supportRequestNumber: str) -> Dict[str, Any]:
+    def executeNrpQuery(self, subscriptionId: str, resourceGroup: str, incidentTime: str, supportRequestNumber: str, incidentId: str) -> Dict[str, Any]:
+        print("entered executeNrpQuery")
         queryStr = f"{queryQos}logs_of_interest(\"{subscriptionId}\", \"{resourceGroup}\", datetime(\"{incidentTime}\"))"
         try:
             response = nrpClient.execute("mdsnrp", queryStr)
             resultDf = dataframe_from_result_table(response.primary_results[0])
             if not resultDf.empty:
-                print('executeNrpQuery srn:', supportRequestNumber)
-                resultDf['supportRequestNumber'] = f"https://portal.microsofticm.com/imp/v5/incidents/details/{supportRequestNumber}/summary"
+                resultDf['supportRequestNumber'] = supportRequestNumber
+                resultDf['icmLink'] = f"https://portal.microsofticm.com/imp/v5/incidents/details/{incidentId}/summary"
                 self.parseErrorDetails(resultDf)
                 self.mapToTeams(resultDf)
                 self.get_predicted_owning_team(resultDf)
                 html_table = Helper.dataframe_to_html(resultDf)
                 resultDict = resultDf.to_dict(orient='records')
-                formatted_link = f"http://127.0.0.1:5000/show_table?subscriptionId={subscriptionId}&resourceGroup={resourceGroup}&incidentTime={incidentTime}&supportRequestNumber={supportRequestNumber}"
-                return {"status": "success", "a_html_table_link": formatted_link, "data": resultDict, "html_table": html_table}
+                formatted_link = f"http://127.0.0.1:5000/show_table?subscriptionId={subscriptionId}&resourceGroup={resourceGroup}&incidentTime={incidentTime}&supportRequestNumber={supportRequestNumber}&incidentId={incidentId}"
+                return {"status": "success", "a_htmlTableLink": formatted_link,"data": resultDict, "htmlTable": html_table}
             else:
                 return {"status": "no_data", "message": "No ErrorDetails found."}
         except KustoServiceError as e:
@@ -205,25 +241,31 @@ class Exceptions(Resource):
 
         errorLogs['predictedOwningTeam'] = errorLogs['mappedTeams'].apply(get_team)
         return errorLogs                        
-    
 
-    ####### executing #######
+    ####### executing #######   
     def get(self):
-        supportRequestNumber = request.args.get('support_request_number')
-        if not supportRequestNumber:
-            return {"error": "supportRequestNumber is required"}, 400
+        incidentId = request.args.get('incident_id')
+        if not incidentId:
+            return {"error": "incidentId is required"}, 400
         
-        icmResult = self.executeIcmQuery(supportRequestNumber)
+        icmResult = self.executeIcmQuery(incidentId)
         if 'error' in icmResult:
             return jsonify({"result": icmResult})
-        
+        print("\t/t back in get")
         subscriptionId = icmResult['subscriptionId']
         resourceGroup = icmResult['resourceGroup']
         incidentTime = icmResult['criTime']
-        supportRequestNumber2 = icmResult['supportRequestNumber']
+        supportRequestNumber = icmResult['supportRequestNumber']
+        incidentId = icmResult['incidentId']
         
-        nrpResult = self.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, supportRequestNumber)
-        return jsonify({"icmResult": icmResult, "nrpResult": nrpResult})
+        nrpResult = self.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, supportRequestNumber, incidentId)
+        print("finished nrp result")
+        data = nrpResult.get('data', [])
+        if data:
+            first_entry = data[0]
+            predictedTeam = first_entry.get('predictedTeam', 'CLOUDNET/NRP')
+        return jsonify({"icmResult": icmResult, "predictedTeam": predictedTeam, "nrpResult": nrpResult}) 
+        # return jsonify({"predictedTeam": predictedTeam}) 
 
 @app.route('/show_table')
 def show_table():
@@ -231,19 +273,27 @@ def show_table():
     resourceGroup = request.args.get('resourceGroup')
     incidentTime = request.args.get('incidentTime')
     supportRequestNumber = request.args.get('supportRequestNumber')
-    # print('srn:', supportRequestNumber)
+    incidentId = request.args.get('incidentId')
 
-    if not subscriptionId or not resourceGroup or not incidentTime:
-        return {"error": "All parameters (subscriptionId, resourceGroup, incidentTime) are required"}, 400
+    if not subscriptionId or not resourceGroup or not incidentTime or not supportRequestNumber or not incidentId:
+        error_message = {
+            "error": "All parameters (subscriptionId, resourceGroup, incidentTime, supportRequestNumber, incidentId) are required.",
+            "details": {
+                "subscriptionId": subscriptionId,
+                "resourceGroup": resourceGroup,
+                "incidentTime": incidentTime,
+                "supportRequestNumber": supportRequestNumber,
+                "incidentId": incidentId
+            }
+        }
+        return error_message, 400
    
     exceptions_instance = Exceptions()
-    nrpResult = exceptions_instance.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, supportRequestNumber)
-
+    nrpResult = exceptions_instance.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, supportRequestNumber, incidentId)
     if 'status' in nrpResult and nrpResult['status'] == 'error':
         return jsonify({"result": nrpResult})
     
-    html_table = nrpResult.get("html_table", "No data available")
-    formatted_link = nrpResult.get("formatted_link", "")
+    html_table = nrpResult.get("htmlTable", "No data available")
 
     return render_template_string('''
     <!DOCTYPE html>
