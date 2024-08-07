@@ -22,15 +22,25 @@ from io import StringIO
 app = Flask(__name__)
 api = Api(app)
 
+queryTimeWindow = r"""
+let timeWindow = (subscriptionId: string, incidentTime: string) { 
+    cluster('Nrp').database("mdsnrp").QosEtwEvent
+    | where TIMESTAMP between(todatetime(incidentTime)-6d..todatetime(incidentTime))
+    | where SubscriptionId == subscriptionId
+    | where Success == "0"
+    | summarize error_count = count() by SubscriptionId, bin(TIMESTAMP, 1h)
+    | order by error_count desc
+    | top 1 by error_count
+    | project TIMESTAMP
+};
+"""
 
 queryQos = r"""
-let logs_of_interest = (subscription_id: string, resource_group: string, incident_time: datetime) { 
-    let incidentStart = datetime_add('day',-1, incident_time);
-    let incidentEnd = datetime_add('day', 1, incident_time);
+let logsOfInterest = (subscriptionId: string, resourceGroup: string, incidentTime: datetime) { 
     cluster('nrp.kusto.windows.net').database('mdsnrp').QosEtwEvent
-        | where TIMESTAMP between(incidentStart..incidentEnd)
-        | where SubscriptionId == subscription_id
-        //| where ResourceGroup =~ resource_group
+        | where TIMESTAMP between(incidentTime-1h..incidentTime+1h)
+        | where SubscriptionId == subscriptionId
+        //| where ResourceGroup =~ resourceGroup
         | where Success == "0"
         | where UserError == false
         | sort by TIMESTAMP asc
@@ -41,9 +51,9 @@ let logs_of_interest = (subscription_id: string, resource_group: string, inciden
 
 # Use when you want only want to see team history, no intermediary hops
 queryTeamHistory = r"""
-let teamHistory = (incident_id: string) {
+let teamHistory = (incidentId: string) {
     cluster('https://icmcluster.kusto.windows.net').database('IcMDataWarehouse').Incidents
-        | where IncidentId == incident_id
+        | where IncidentId == incidentId
         | order by ModifiedDate asc
         | serialize Sequence = row_number()
         | summarize FirstOccurrence = min(Sequence) by OwningTeamName
@@ -54,9 +64,9 @@ let teamHistory = (incident_id: string) {
 
 # Use when you want to see all the team history, back-n-forth hops included
 queryTeamHistoryAll = r"""
-let teamHistoryAll = (incident_id: string) {
+let teamHistoryAll = (incidentId: string) {
     cluster('https://icmcluster.kusto.windows.net').database('IcMDataWarehouse').Incidents
-        | where IncidentId == incident_id
+        | where IncidentId == incidentId
         | order by ModifiedDate asc
         | extend PreviousTeamName = prev(OwningTeamName)
         | where OwningTeamName != PreviousTeamName or isnull(PreviousTeamName)
@@ -137,7 +147,7 @@ class Exceptions(Resource):
         try:
             response = icmClient.execute("IcMDataWarehouse", queryFindIcms)
             resultDf = dataframe_from_result_table(response.primary_results[0])
-            print('after icm query find icms')
+
             if not resultDf.empty:
                 incidentIds = list(resultDf['IncidentId'].tolist())
                 return incidentIds
@@ -158,7 +168,7 @@ class Exceptions(Resource):
             
             responseTeams = icmClient.execute("IcMDataWarehouse", queryStrTeams)
             resultTeams = dataframe_from_result_table(responseTeams.primary_results[0])
-            print('in executeIcmQuery')
+
             if not resultIncident.empty and not resultTeams.empty:
                 combined_result = pd.merge(resultIncident, resultTeams, on='IncidentId', how='left', suffixes=('', '_TeamHistory'))
                 return self.parseSummary(combined_result)
@@ -184,20 +194,35 @@ class Exceptions(Resource):
         resultDf = resultDf.drop(columns=['Summary'])
         return resultDf
 
-    
+    ####### Time Window of most error logs #######
+    def executeTimeQuery(self, subscriptionId: str, incidentTime: str) -> str:
+        queryStrTime = f"{queryTimeWindow}timeWindow(\"{subscriptionId}\", \"{incidentTime}\")"
+        try:
+            response = nrpClient.execute("IcMDataWarehouse", queryStrTime)
+            result = dataframe_from_result_table(response.primary_results[0])
+            
+            if not result.empty:
+                return result.iat[0]
+            else:
+                return incidentTime
+        except KustoServiceError as e:
+            return incidentTime
+        except Exception as e:
+            return incidentTime
+        
     ####### NRP #######
     def executeNrpQuery(self, subscriptionId: str, incidentTime: str, incidentId:int, resourceGroup: str = 'temp') -> pd.DataFrame:
-        queryStr = f"{queryQos}logs_of_interest(\"{subscriptionId}\", \"{resourceGroup}\", datetime(\"{incidentTime}\"))"
+        queryStr = f"{queryQos}logsOfInterest(\"{subscriptionId}\", \"{resourceGroup}\", datetime(\"{incidentTime}\"))"
         try:
             response = nrpClient.execute("mdsnrp", queryStr)
             resultDf = dataframe_from_result_table(response.primary_results[0])
             if not resultDf.empty:
                 resultDf = self.parseErrorDetails(resultDf)
                 resultDf = self.mapToTeams(resultDf)
-                resultDf = self.get_predicted_owning_team(resultDf)
+                resultDf = self.getPredictedOwningTeam(resultDf)
                 resultDf['TIMESTAMP'] = resultDf['TIMESTAMP'].apply(Helper.formattedDatetime)
                 
-                # Need if check if its empty now after removing rows in previous functions
+                # A check to see if it's empty after removing rows in previous functions
                 if resultDf.empty:
                     return pd.DataFrame({'status': ['no_data'], 'message': [f'executeNrpQuery/others: Unable to match ErrorDetails to a team for incident: {incidentId}']})
                 return resultDf
@@ -230,22 +255,22 @@ class Exceptions(Resource):
             for lineIndex, line in enumerate(cleanedLines):
                 for key, team in teamMap.items():
                     matches = list(re.finditer(key.lower(), line.lower()))
-                    num_matches = len(matches)
+                    numMatches = len(matches)
                     if matches:
-                        last_match = matches[-1]
-                        before_key = line[:last_match.start()]
-                        words_before_key = len(before_key.split())
+                        lastMatch = matches[-1]
+                        beforeKey = line[:lastMatch.start()]
+                        wordsBeforeKey = len(beforeKey.split())
 
                         if key in teamCounts:
-                            teamCounts[key]['match_count'] += num_matches
-                            if lineIndex <= teamCounts[key]['exception_method_idx'][0]:
-                                teamCounts[key]['exception_method_idx'] = [lineIndex, words_before_key]
+                            teamCounts[key]['matchCount'] += numMatches
+                            if lineIndex <= teamCounts[key]['exceptionMethodIdx'][0]:
+                                teamCounts[key]['exceptionMethodIdx'] = [lineIndex, wordsBeforeKey]
                         else:
                             teamCounts[key] = teamCounts[key] = {
-                                'team_key': key,
-                                'team_value': team,
-                                'match_count': num_matches,
-                                'exception_method_idx' : [lineIndex, words_before_key]
+                                'teamKey': key,
+                                'teamValue': team,
+                                'matchCount': numMatches,
+                                'exceptionMethodIdx' : [lineIndex, wordsBeforeKey]
                             }
             return list(teamCounts.values())
         
@@ -254,17 +279,17 @@ class Exceptions(Resource):
         errorLogs = errorLogs[errorLogs['MappedTeams'].map(len) > 0]
         return errorLogs
 
-    def get_predicted_owning_team(self, errorLogs: pd.DataFrame) -> pd.DataFrame:
-        def sorting_criteria(team: Dict[str, Any]) -> tuple:
-            return (-team['match_count'], team['exception_method_idx'][0], -team['exception_method_idx'][1])
+    def getPredictedOwningTeam(self, errorLogs: pd.DataFrame) -> pd.DataFrame:
+        def sortingCriteria(team: Dict[str, Any]) -> tuple:
+            return (-team['matchCount'], team['exceptionMethodIdx'][0], -team['exceptionMethodIdx'][1])
 
-        def get_team(MappedTeams: List[Dict[str, Any]]) -> str:
-            sorted_teams = sorted(MappedTeams, key=sorting_criteria)
+        def getTeam(MappedTeams: List[Dict[str, Any]]) -> str:
+            sorted_teams = sorted(MappedTeams, key=sortingCriteria)
             if sorted_teams:
-                return sorted_teams[0]['team_value']
+                return sorted_teams[0]['teamValue']
             return ""
 
-        errorLogs['PredictedOwningTeam'] = errorLogs['MappedTeams'].apply(get_team)
+        errorLogs['PredictedOwningTeam'] = errorLogs['MappedTeams'].apply(getTeam)
         return errorLogs 
 
     ####### Shared Processing #######
@@ -272,8 +297,8 @@ class Exceptions(Resource):
         # Check if all PredictedOwningTeam values are the same
         if nrpDf['PredictedOwningTeam'].nunique() == 1:
             # Get the log with the most mentions of that team
-            most_mentions_log = nrpDf.loc[nrpDf['MappedTeams'].apply(lambda teams: sum(team['team_value'] == nrpDf['PredictedOwningTeam'].iloc[0] for team in teams)).idxmax()]
-            newDf = pd.DataFrame([most_mentions_log])
+            mostMentionsLog = nrpDf.loc[nrpDf['MappedTeams'].apply(lambda teams: sum(team['teamValue'] == nrpDf['PredictedOwningTeam'].iloc[0] for team in teams)).idxmax()]
+            newDf = pd.DataFrame([mostMentionsLog])
         else:
             # Get the first occurrence of each log that has a different PredictedOwningTeam
             newDf = nrpDf.drop_duplicates(subset=['PredictedOwningTeam'], keep='first')
@@ -311,7 +336,7 @@ class Exceptions(Resource):
         #print({"icmResult": icmResult.to_dict(orient='records')})
     
         subscriptionId = icmResult.iloc[0]['SubscriptionId']
-        incidentTime = icmResult.iloc[0]['IncidentStartTime']
+        incidentTime = self.executeTimeQuery(subscriptionId, icmResult.iloc[0]['IncidentStartTime'])
     
         nrpResult = self.executeNrpQuery(subscriptionId, incidentTime, incidentId)
         if 'status' in nrpResult.columns:
@@ -338,27 +363,27 @@ class Exceptions(Resource):
         return jsonify({"TableLink" : tableLink, "logTLDR": logTLDR.to_dict(orient='records')}) 
 
     # Use when you want to find the ICMs
-    def get(self):
-        icmIdList = self.executeFindIcmsQuery()
-        print(icmIdList)
-        allIcmDf = pd.DataFrame()
-        # icmIdList = pd.DataFrame([511101094, 519639582, 526186661, 525907329])
-        # allIcm_df = pd.DataFrame()
+    # def get(self):
+    #     icmIdList = self.executeFindIcmsQuery()
+    #     print(icmIdList)
+    #     allIcmDf = pd.DataFrame()
+    #     # icmIdList = pd.DataFrame([511101094, 519639582, 526186661, 525907329])
+    #     # allIcm_df = pd.DataFrame()
         
-        for incidentId in icmIdList:
-            logTLDR = self.runBody(incidentId)
+    #     for incidentId in icmIdList:
+    #         logTLDR = self.runBody(incidentId)
     
-            if 'status' in logTLDR.columns:
-                print(f'Incident {incidentId} failed in', logTLDR['message'].iloc[0])
-                continue
-            print(f'Processing incident {incidentId}')
-            allIcmDf = pd.concat([allIcmDf, logTLDR], ignore_index=True)
+    #         if 'status' in logTLDR.columns:
+    #             print(f'Incident {incidentId} failed in', logTLDR['message'].iloc[0])
+    #             continue
+    #         print(f'Processing incident {incidentId}')
+    #         allIcmDf = pd.concat([allIcmDf, logTLDR], ignore_index=True)
 
-        # Add html table to output
-        allIcmDfjson = quote(allIcmDf.to_json(orient='records'))
-        tableLink = f"http://127.0.0.1:5000/show_table?logTLDR={allIcmDfjson}"            
+    #     # Add html table to output
+    #     allIcmDfjson = quote(allIcmDf.to_json(orient='records'))
+    #     tableLink = f"http://127.0.0.1:5000/show_table?logTLDR={allIcmDfjson}"            
 
-        return jsonify({"TableLink" : tableLink, "allIcm_df": allIcmDf.to_dict(orient='records')})
+    #     return jsonify({"TableLink" : tableLink, "allIcm_df": allIcmDf.to_dict(orient='records')})
 
 @app.route('/show_table', methods=['POST'])
 def show_table():
@@ -369,10 +394,10 @@ def show_table():
     
     # Convert JSON string back to DataFrame
     # logTLDRjson = unquote(logTLDRjson)
-    logTLDR_df = pd.read_json(StringIO(logTLDRjson))
+    logTLDRdf = pd.read_json(StringIO(logTLDRjson))
     
     # Convert DataFrame to HTML table
-    htmlTable = logTLDR_df.to_html()
+    htmlTable = logTLDRdf.to_html()
 
     return render_template_string('''
     <!DOCTYPE html>
