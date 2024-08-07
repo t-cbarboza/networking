@@ -15,7 +15,7 @@ import pandas as pd
 from pandas.core.frame import DataFrame
 from tabulate import tabulate
 import json
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from io import StringIO
 
 
@@ -61,7 +61,7 @@ let teamHistoryAll = (incident_id: string) {
         | extend PreviousTeamName = prev(OwningTeamName)
         | where OwningTeamName != PreviousTeamName or isnull(PreviousTeamName)
         | project ModifiedDate, OwningTeamName, Status, IncidentId
-        | summarize teamHistory = make_list(pack('OwningTeamName', OwningTeamName, 'ModifiedDate', ModifiedDate)) by IncidentId
+        | summarize TeamHistory = make_list(pack('OwningTeamName', OwningTeamName, 'ModifiedDate', ModifiedDate)) by IncidentId
 };
 """
 
@@ -160,7 +160,7 @@ class Exceptions(Resource):
             resultTeams = dataframe_from_result_table(responseTeams.primary_results[0])
             print('in executeIcmQuery')
             if not resultIncident.empty and not resultTeams.empty:
-                combined_result = pd.merge(resultIncident, resultTeams, on='IncidentId', how='left', suffixes=('', 'TeamHistory'))
+                combined_result = pd.merge(resultIncident, resultTeams, on='IncidentId', how='left', suffixes=('', '_TeamHistory'))
                 return self.parseSummary(combined_result)
             else:
                 return pd.DataFrame({'status': ['no_data'], 'message': [f'executeIcmQuery: Unable to combine ICM with team history on incident: {incidentId}']})
@@ -288,11 +288,17 @@ class Exceptions(Resource):
             return nrpCombinedDf
 
         # TODO: If there are two predicted teams for the same subscription + time combo, need to test that icm info will apply to both
-        mergedDf = pd.merge(nrpCombinedDf, icmDf, on='SubscriptionId', how='inner') # they both have ResourceGroup, consider joining on it too (have to .lower())
+        mergedDf = pd.merge(nrpCombinedDf, icmDf, on='SubscriptionId', how='inner', suffixes=('_nrp', '_icm'))
         if mergedDf.empty:
             return pd.DataFrame({'status': ['no_data'], 'message': ['combineNrpIcm: Table empty after combining nrpDf and icmDf']})
         
-        mergedDf = mergedDf.drop(columns=['ErrorDetails','StackTrace', 'CorrelationRequestId', 'ErrorCode', 'OperationId', 'OperationName', 'MappedTeams', 'SupportTicketId'])
+        mergedDf = mergedDf.drop(columns=['ErrorDetails','StackTrace', 'CorrelationRequestId', 'ErrorCode', 'ResourceGroup', 'OperationId', 'OperationName', 'MappedTeams', 'SupportTicketId'])
+        
+        # Add 'PredictedTeamInHistory' column
+        mergedDf['PredictedTeamInHistory'] = mergedDf.apply(
+            lambda row: any(team['OwningTeamName'] == row['PredictedOwningTeam'] for team in row['TeamHistory']),
+            axis=1
+        )
         return mergedDf
 
     def runBody(self, incidentId: str) -> pd.DataFrame:
@@ -319,17 +325,17 @@ class Exceptions(Resource):
         return logTLDR
 
     # Use when you want to grab info for one icm
-    # def get(self):
-    #     incidentId = request.args.get('incident_id')
-    #     logTLDR = self.runBody(incidentId)
+    def get(self):
+        incidentId = request.args.get('incident_id')
+        logTLDR = self.runBody(incidentId)
     
-    #     if 'status' in logTLDR.columns:
-    #         return jsonify({"result": logTLDR.to_dict(orient='records')})
+        if 'status' in logTLDR.columns:
+            return jsonify({"result": logTLDR['message'].iloc[0]})
         
-    #     logTLDRjson = quote(logTLDR.to_json(orient='records'))
-    #     tableLink = f"http://127.0.0.1:5000/show_table?logtldr={logTLDRjson}"
+        logTLDRjson = quote(logTLDR.to_json(orient='records'))
+        tableLink = f"http://127.0.0.1:5000/show_table?logtldr={logTLDRjson}"
         
-    #     return jsonify({"TableLink" : tableLink, "logTLDR": logTLDR.to_dict(orient='records')}) 
+        return jsonify({"TableLink" : tableLink, "logTLDR": logTLDR.to_dict(orient='records')}) 
 
     # Use when you want to find the ICMs
     def get(self):
@@ -354,18 +360,19 @@ class Exceptions(Resource):
 
         return jsonify({"TableLink" : tableLink, "allIcm_df": allIcmDf.to_dict(orient='records')})
 
-@app.route('/show_table')
+@app.route('/show_table', methods=['POST'])
 def show_table():
-    logTLDR_json = request.args.get('logTLDR')
+    logTLDRjson = request.args.get('logtldr')
     
-    if not logTLDR_json:
+    if not logTLDRjson:
         return {"error": "logTLDR data is required"}, 400
     
     # Convert JSON string back to DataFrame
-    logTLDR_df = pd.read_json(StringIO(logTLDR_df))
+    # logTLDRjson = unquote(logTLDRjson)
+    logTLDR_df = pd.read_json(StringIO(logTLDRjson))
     
     # Convert DataFrame to HTML table
-    html_table = logTLDR_df.to_html()
+    htmlTable = logTLDR_df.to_html()
 
     return render_template_string('''
     <!DOCTYPE html>
@@ -379,7 +386,7 @@ def show_table():
         {{ table|safe }}
     </body>
     </html>
-    ''', table=html_table)
+    ''', table=htmlTable)
 
 def signalHandler(signal, frame):
     print('Shutting down gracefully...')
