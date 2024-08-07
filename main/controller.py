@@ -94,7 +94,8 @@ queryFindIcms = r"""cluster('https://icmcluster.kusto.windows.net').database('Ic
     | take 20;
 """
 
-teamMap = {
+teamMap = { 
+    # teams appear in kusto icm incidents table as CLOUDNET\\<team-name> and in icm portal as Cloudnet/<team-name>
     "rnm": "CLOUDNET\\RNM",
     "nrpinternal": "CLOUDNET\\NRP",
     "networkanalytics": "CLOUDNET\\NetAnalytics",
@@ -129,10 +130,6 @@ class Helper:
         datetimeObj = datetime.strptime(inputDatetime, "%m/%d/%Y %I:%M:%S %p UTC")
         outputDatetimeStr = datetimeObj.strftime("%Y-%m-%dT%H:%M:%S")
         return outputDatetimeStr
-    
-    @staticmethod
-    def dataframe_to_html(df: pd.DataFrame) -> str:
-        return df.to_html()
 
 class Exceptions(Resource):
     ####### ICM -- find incidents that match our criteria #######
@@ -166,32 +163,30 @@ class Exceptions(Resource):
                 combined_result = pd.merge(resultIncident, resultTeams, on='IncidentId', how='left', suffixes=('', 'TeamHistory'))
                 return self.parseSummary(combined_result)
             else:
-                return pd.DataFrame({'status': ['no_data'], 'message': [f'Unable to combine ICM with team history on incident: {incidentId}']})
+                return pd.DataFrame({'status': ['no_data'], 'message': [f'executeIcmQuery: Unable to combine ICM with team history on incident: {incidentId}']})
         except KustoServiceError as e:
             return pd.DataFrame({'error': [str(e)]})
         except Exception as e:
             return pd.DataFrame({'error': [str(e)]})
     
     def parseSummary(self, resultDf: pd.DataFrame) -> pd.DataFrame:
-        resource_uri_pattern = rf'/subscriptions/{resultDf["SubscriptionId"].iat[0]}/resource[Gg]roups/([0-9a-zA-Z-_]+)/providers/Microsoft\.Network/([0-9a-zA-Z-_]+)/([0-9a-zA-Z-_]+)'
-        datetime_pattern = r'(\d{1,2}/\d{1,2}/\d{4}\s\d{1,2}:\d{2}:\d{2}\s[AP]M\sUTC)'
+        resourceUriPattern = rf'/subscriptions/{resultDf["SubscriptionId"].iat[0]}/resource[Gg]roups/([0-9a-zA-Z-_]+)/providers/Microsoft\.Network/([0-9a-zA-Z-_]+)/([0-9a-zA-Z-_]+)'
+        datetimePattern = r'(\d{1,2}/\d{1,2}/\d{4}\s\d{1,2}:\d{2}:\d{2}\s[AP]M\sUTC)'
 
         def extract_match(pattern, text, group_index, default='not_found'):
             match = re.search(pattern, text)
             return match.group(group_index) if match else default
-        print("the time found was: ", extract_match(datetime_pattern, resultDf['Summary'].iloc[0], 1))
-        # resultDf['ResourceGroup'] = resultDf['Summary'].apply(lambda x: extract_match(resource_uri_pattern, x, 1))
-        # resultDf['Provider'] = resultDf['Summary'].apply(lambda x: extract_match(resource_uri_pattern, x, 2))
-        # resultDf['ProviderName'] = resultDf['Summary'].apply(lambda x: extract_match(resource_uri_pattern, x, 3))
-        resultDf['IncidentStartTime'] = resultDf['Summary'].apply(lambda x: Helper.formattedDatetime(extract_match(datetime_pattern, x, 1, resultDf['IncidentStartTime'].iloc[0])))
+        resultDf['IncidentStartTime'] = resultDf['Summary'].apply(lambda x: Helper.formattedDatetime(extract_match(datetimePattern, x, 1, resultDf['IncidentStartTime'].iloc[0])))
         resultDf['IcmLink'] = resultDf.apply(lambda row: f"https://portal.microsofticm.com/imp/v5/incidents/details/{row['IncidentId']}/summary", axis=1)
+        # resultDf['ResourceGroup'] = resultDf['Summary'].apply(lambda x: extract_match(resourceUriPattern, x, 1, 'not_Found'))
+        # resultDf['Provider'] = resultDf['Summary'].apply(lambda x: extract_match(resourceUriPattern, x, 2))
+        # resultDf['ProviderName'] = resultDf['Summary'].apply(lambda x: extract_match(resourceUriPattern, x, 3))
         resultDf = resultDf.drop(columns=['Summary'])
         return resultDf
 
     
     ####### NRP #######
-    def executeNrpQuery(self, subscriptionId: str, resourceGroup: str, incidentTime: str, incidentId:int) -> pd.DataFrame:
-        #print("entered executeNrpQuery")
+    def executeNrpQuery(self, subscriptionId: str, incidentTime: str, incidentId:int, resourceGroup: str = 'temp') -> pd.DataFrame:
         queryStr = f"{queryQos}logs_of_interest(\"{subscriptionId}\", \"{resourceGroup}\", datetime(\"{incidentTime}\"))"
         try:
             response = nrpClient.execute("mdsnrp", queryStr)
@@ -204,10 +199,10 @@ class Exceptions(Resource):
                 
                 # Need if check if its empty now after removing rows in previous functions
                 if resultDf.empty:
-                    return pd.DataFrame({'status': ['no_data'], 'message': [f'Unable to match ErrorDetails to a team for incident: {incidentId}']})
+                    return pd.DataFrame({'status': ['no_data'], 'message': [f'executeNrpQuery/others: Unable to match ErrorDetails to a team for incident: {incidentId}']})
                 return resultDf
             else:
-                return pd.DataFrame({'status': ['no_data'], 'message': [f'No ErrorDetails found in NRP table for incident: {incidentId}']})
+                return pd.DataFrame({'status': ['no_data'], 'message': [f'executeNrpQuery: No ErrorDetails found in NRP table for incident: {incidentId}']})
         except KustoServiceError as e:
             return pd.DataFrame({'status': ['error'], 'message': [str(e)]})
         except Exception as e:
@@ -254,7 +249,7 @@ class Exceptions(Resource):
                             }
             return list(teamCounts.values())
         
-        # Remove any rows where its not able to map log to a team
+        # Remove any rows where its not able to map the log to a team
         errorLogs['MappedTeams'] = errorLogs['ExceptionCallStack'].apply(mapLineToTeam)
         errorLogs = errorLogs[errorLogs['MappedTeams'].map(len) > 0]
         return errorLogs
@@ -272,6 +267,7 @@ class Exceptions(Resource):
         errorLogs['PredictedOwningTeam'] = errorLogs['MappedTeams'].apply(get_team)
         return errorLogs 
 
+    ####### Shared Processing #######
     def combineNrpLogs(self, nrpDf: pd.DataFrame) -> pd.DataFrame:
         # Check if all PredictedOwningTeam values are the same
         if nrpDf['PredictedOwningTeam'].nunique() == 1:
@@ -283,117 +279,80 @@ class Exceptions(Resource):
             newDf = nrpDf.drop_duplicates(subset=['PredictedOwningTeam'], keep='first')
         
         if newDf.empty:
-            return pd.DataFrame({'status': ['no_data'], 'message': ['table empty after combining all errorDetail logs']})
+            return pd.DataFrame({'status': ['no_data'], 'message': ['combineNrpLogs: Table empty after combining all errorDetail logs']})
         return newDf
     
     def combineNrpIcm(self, nrpDf: pd.DataFrame, icmDf: pd.DataFrame) -> pd.DataFrame:
         nrpCombinedDf = self.combineNrpLogs(nrpDf)
         if 'status' in nrpCombinedDf.columns:
             return nrpCombinedDf
-  
-        # TODO: if there are two predicted teams for the same subscription + time combo, need to test that icm info will apply to both
-        mergedDf = pd.merge(nrpCombinedDf, icmDf, on='SubscriptionId', how='inner')
-        if mergedDf.empty:
-            return pd.DataFrame({'status': ['no_data'], 'message': ['table empty after combining nrpDf and icmDf']})
-        
-        mergedDf = mergedDf.drop(columns=['ErrorDetails','StackTrace', 'CorrelationRequestId', 'ResourceGroup', 'ErrorCode', 'OperationId', 'OperationName', 'MappedTeams', 'SupportTicketId'])
-        return mergedDf
-    
-    def combineAll(self, nrpDf: pd.DataFrame, icmDf: pd.DataFrame, combo: pd.DataFrame) -> pd.DataFrame:
-        newDf = self.combineNrpIcm(nrpDf, icmDf)
-        if 'status' in newDf.columns:
-            return newDf
-        combo = pd.concat([combo, newDf], ignore_index=True)
-        # Handle NaT values before converting to JSON
-        combo = combo.drop(columns=['TIMESTAMP'])
-        # combo.fillna('', inplace=True)
-        # combo.replace({pd.NaT: ''}, inplace=True)
-        
-    
-        return combo
 
-    # Use when you want to grab info for one icm
-    def get(self):
-        incidentId = request.args.get('incident_id')
-        if not incidentId:
-            return {"error": "incident_id is required"}, 400
+        # TODO: If there are two predicted teams for the same subscription + time combo, need to test that icm info will apply to both
+        mergedDf = pd.merge(nrpCombinedDf, icmDf, on='SubscriptionId', how='inner') # they both have ResourceGroup, consider joining on it too (have to .lower())
+        if mergedDf.empty:
+            return pd.DataFrame({'status': ['no_data'], 'message': ['combineNrpIcm: Table empty after combining nrpDf and icmDf']})
         
+        mergedDf = mergedDf.drop(columns=['ErrorDetails','StackTrace', 'CorrelationRequestId', 'ErrorCode', 'OperationId', 'OperationName', 'MappedTeams', 'SupportTicketId'])
+        return mergedDf
+
+    def runBody(self, incidentId: str) -> pd.DataFrame:
+        if not incidentId:
+            return pd.DataFrame({'status': ['error'], 'message': ['incident_id is required']})
+    
         icmResult = self.executeIcmQuery(incidentId)
         if 'error' in icmResult.columns:
-            return jsonify({"result of executeIcmQuery": icmResult.to_dict(orient='records')})
-        
+            return icmResult
+        #print({"icmResult": icmResult.to_dict(orient='records')})
+    
         subscriptionId = icmResult.iloc[0]['SubscriptionId']
-        # resourceGroup = icmresult.iloc[0]['resourceGroup']
-        resourceGroup = 'resourceGroup'
         incidentTime = icmResult.iloc[0]['IncidentStartTime']
-        
-        nrpResult = self.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, incidentId)
+    
+        nrpResult = self.executeNrpQuery(subscriptionId, incidentTime, incidentId)
         if 'status' in nrpResult.columns:
-            return jsonify({"result of executeNrpQuery": nrpResult.to_dict(orient='records')})
-        
+            return nrpResult
+        #print({"nrpResult": nrpResult.to_dict(orient='records')})
+    
         logTLDR = self.combineNrpIcm(nrpResult, icmResult)
         if 'status' in logTLDR.columns:
-            return jsonify({"result of combine_df":  logTLDR.to_dict(orient='records')}), 404
-        return jsonify({"new_df": logTLDR.to_dict(orient='records')})
-        
-        logTLDR.fillna('', inplace=True)
-        logTLDR.replace({pd.NaT: ''}, inplace=True)
-        
-        logTLDRjson = quote(logTLDR.to_json(orient='records'))
-        tableLink = f"http://127.0.0.1:5000/show_table?logtldr={logTLDRjson}"
-        
-        # see the intermediary tables
-        #return jsonify({"tablelink" : tablelink, "icmResult": icmresult.to_dict(orient='records'), "nrpresult": nrpresult.to_dict(orient='records')})
-        # to see the simplified table
-        return jsonify({"tableLink" : tableLink, "new_df": logTLDR.to_dict(orient='records')}) 
+            return logTLDR
+    
+        return logTLDR
 
-    # # Use when you want to find the ICMs
+    # Use when you want to grab info for one icm
     # def get(self):
-    #     icmIdList = self.executeFindIcmsQuery()
-    #     print(icmIdList)
-    #     allIcm_df = pd.DataFrame()
-    #     # icmIdList = pd.DataFrame([511101094, 519639582, 526186661, 525907329])
-    #     # allIcm_df = pd.DataFrame()
+    #     incidentId = request.args.get('incident_id')
+    #     logTLDR = self.runBody(incidentId)
+    
+    #     if 'status' in logTLDR.columns:
+    #         return jsonify({"result": logTLDR.to_dict(orient='records')})
         
-    #     for incidentId in icmIdList:
-    #         icmResult = self.executeIcmQuery(incidentId)
-    #         if 'error' in icmResult.columns:
-    #             return jsonify({"result of executeIcmQuery": icmResult.to_dict(orient='records')})
+    #     logTLDRjson = quote(logTLDR.to_json(orient='records'))
+    #     tableLink = f"http://127.0.0.1:5000/show_table?logtldr={logTLDRjson}"
         
-    #         icmResult = self.parseSummary(icmResult)
-    #         subscriptionId = icmResult.iloc[0]['SubscriptionId']
-    #         resourceGroup = icmResult.iloc[0]['ResourceGroup']
-    #         incidentTime = icmResult.iloc[0]['IncidentStartTime']
-        
-    #         nrpResult = self.executeNrpQuery(subscriptionId, resourceGroup, incidentTime, incidentId)
-    #         if 'status' in nrpResult.columns: 
-    #             if nrpResult.iloc[0]['status'] == 'error':
-    #                 return jsonify({"result of executeNrpQuery": nrpResult.to_dict(orient='records')})
-    #             if nrpResult.iloc[0]['status'] == 'no_data':
-    #                 print(f'No QosEtwEvent results for icm: {incidentId}')
-    #                 continue
-     
-    #         allIcm_df = self.combine_df2(nrpResult, icmResult, allIcm_df)
-    #         if allIcm_df.empty:
-    #             return jsonify({"error in allIcm_df": "Could not combine tables"}), 404
-        
+    #     return jsonify({"TableLink" : tableLink, "logTLDR": logTLDR.to_dict(orient='records')}) 
 
-    #     print("Checking for NaT values in logTLDR DataFrame")
-    #     print(allIcm_df.isna().sum())
-
-    #     rows_with_nan = allIcm_df[allIcm_df.isna().any(axis=1)]
-    #     print("Rows with NaN or NaT values:")
-    #     print(rows_with_nan)
-
-    #     # Add html table to output
-    #     logTLDR_json = quote(allIcm_df.to_json(orient='records'))
-    #     tableLink = f"http://127.0.0.1:5000/show_table?logTLDR={logTLDR_json}"
+    # Use when you want to find the ICMs
+    def get(self):
+        icmIdList = self.executeFindIcmsQuery()
+        print(icmIdList)
+        allIcmDf = pd.DataFrame()
+        # icmIdList = pd.DataFrame([511101094, 519639582, 526186661, 525907329])
+        # allIcm_df = pd.DataFrame()
         
-    #     allIcm_df.fillna('', inplace=True)
-    #     allIcm_df.replace({pd.NaT: ''}, inplace=True)
-            
+        for incidentId in icmIdList:
+            logTLDR = self.runBody(incidentId)
+    
+            if 'status' in logTLDR.columns:
+                print(f'Incident {incidentId} failed in', logTLDR['message'].iloc[0])
+                continue
+            print(f'Processing incident {incidentId}')
+            allIcmDf = pd.concat([allIcmDf, logTLDR], ignore_index=True)
 
-    #     return jsonify({"TableLink" : tableLink, "allIcm_df": allIcm_df.to_dict(orient='records')})
+        # Add html table to output
+        allIcmDfjson = quote(allIcmDf.to_json(orient='records'))
+        tableLink = f"http://127.0.0.1:5000/show_table?logTLDR={allIcmDfjson}"            
+
+        return jsonify({"TableLink" : tableLink, "allIcm_df": allIcmDf.to_dict(orient='records')})
 
 @app.route('/show_table')
 def show_table():
@@ -406,7 +365,7 @@ def show_table():
     logTLDR_df = pd.read_json(StringIO(logTLDR_df))
     
     # Convert DataFrame to HTML table
-    html_table = Helper.dataframe_to_html(logTLDR_df)
+    html_table = logTLDR_df.to_html()
 
     return render_template_string('''
     <!DOCTYPE html>
